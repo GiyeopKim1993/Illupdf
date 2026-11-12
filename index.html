@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IlluPDF - 클라이언트 사이드 변환 및 네스팅</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body class="dark-theme">
+  <header>
+    <h1>IlluPDF</h1>
+    <div class="controls">
+      <input type="file" id="image-input" accept="image/*" />
+      <label for="preset-select">프리셋:</label>
+      <select id="preset-select">
+        <option value="keyring">키링 (Keyring, 65mm)</option>
+        <option value="stand">스탠디 (Standee, 148mm)</option>
+        <option value="mixed">믹스 (Mixed, 40mm)</option>
+      </select>
+      <input type="file" id="zip-input" accept=".zip" style="display:none;" />
+      <button id="process-btn" disabled>프로세스 시작</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="status-panel">
+      <div class="status-item">
+        <span class="label">상태:</span>
+        <span id="status-text">대기 중</span>
+      </div>
+      <div class="status-item">
+        <span class="label">프리셋:</span>
+        <span id="preset-text">-</span>
+      </div>
+    </section>
+
+    <section id="preview-panel">
+      <div class="canvas-container">
+        <canvas id="main-canvas"></canvas>
+      </div>
+      <div class="step-tracker">
+        <div class="step active" id="step-1">1. 변환</div>
+        <div class="step" id="step-2">2. 네스팅</div>
+        <div class="step" id="step-3">3. PDF</div>
+      </div>
+    </section>
+
+    <section id="result-panel">
+      <button id="download-btn" disabled>PDF 다운로드</button>
+      <div id="log-area"></div>
+    </section>
+  </main>
+
+  <script src="vendor/clipper.js"></script>
+  <script src="js/zip.js"></script>
+  <script src="js/geometry.js"></script>
+  <script src="js/converting-engine.js"></script>
+  <script src="js/pdf-engine.js"></script>
+  <script src="js/nesting-engine.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
