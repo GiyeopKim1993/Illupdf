@@ -40,8 +40,16 @@ for (let y = 40; y < 60; y++) {
     mask[y * 100 + x] = 255;
   }
 }
+// cv2.getStructuringElement(MORPH_ELLIPSE,(11,11)) 는 정사각형이 아니라 "타원" 커널이므로
+// 대각선 모서리 (35,35) 는 채워지지 않고, 축 방향 (40,35) 는 채워진다.
+// (기대값은 Python cv2.dilate 결과와 동일)
 const dilated = g.dilateMask(mask, 100, 100, 5);
-console.assert(dilated[35 * 100 + 35] === 255, 'dilateMask');
+console.assert(dilated[35 * 100 + 35] === 0, 'dilateMask corner stays empty (cv2 ellipse)');
+console.assert(dilated[37 * 100 + 37] === 255, 'dilateMask diagonal inside ellipse');
+console.assert(dilated[40 * 100 + 35] === 255, 'dilateMask axis direction');
+const eroded = g.erodeMask(mask, 100, 100, 5);
+console.assert(eroded[45 * 100 + 45] === 255, 'erodeMask keeps interior');
+console.assert(eroded[42 * 100 + 42] === 0, 'erodeMask removes near-edge');
 
 // 6. Contours
 const loops = g.tracePixelContours(mask, 100, 100);
