@@ -1,0 +1,42 @@
+# Python cache / test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+
+# Virtual environments / local dependency dirs
+.venv/
+.deps/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+src/*.egg-info/
+
+# Local temporary workspaces
+.tmp_tests/
+.tmp_nesting/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Generated local conversion outputs
+output_keyring/
+output_stand/
+
+# Generated test conversion outputs
+temp_test/
+
+# Node / browser test artifacts
+node_modules/
+package-lock.json
+e2e_*.pdf
+
+# Local parity fixtures (not needed in repo)
+parity/
