@@ -27,6 +27,7 @@
     pt_to_mm,
     px_to_pt,
     geometry_bounds,
+    combined_bounds,
     signed_path_area,
     polygon_area_and_centroid,
     translate_path,
@@ -160,6 +161,115 @@
   const CALIBRATION_TOLERANCE_MM = 1.0;
   const CALIBRATION_MAX_ITERATIONS = 3;
 
+  // --- White Spot (port of src/illupdf/converting/engine/vector/white.py) ---
+  // Python: DEFAULT_WHITE_SPOT = "spot_0" (pdf/colors.py)
+  const DEFAULT_WHITE_SPOT = 'spot_0';
+  const WHITE_SPOT_NAMES = {
+    spot_0: { name: 'Spot_0', cmyk: [0.0, 0.0, 0.0, 1.0] },
+    spot_1: { name: 'Spot_1', cmyk: [0.0, 0.0, 0.0, 1.0] },
+    white: { name: 'White', cmyk: [0.0, 0.0, 0.0, 1.0] },
+    rdg_white: { name: 'RDG_WHITE', cmyk: [0.0, 0.0, 0.0, 1.0] },
+    sswhite: { name: 'SSWhite', cmyk: [0.0, 0.0, 0.0, 1.0] },
+  };
+
+  /** Python: _levels_lut / apply_output_levels (Photoshop-style Output Levels) */
+  function apply_output_levels(gray, output_black = 0, output_white = 170) {
+    const out_black = Math.max(0, Math.min(255, Math.trunc(output_black)));
+    const out_white = Math.max(0, Math.min(255, Math.trunc(output_white)));
+    const lut = new Uint8Array(256);
+    for (let value = 0; value < 256; value++) {
+      lut[value] = Math.max(0, Math.min(255,
+        Math.round(out_black + (value / 255.0) * (out_white - out_black))));
+    }
+    const out = new Uint8Array(gray.length);
+    for (let i = 0; i < gray.length; i++) out[i] = lut[gray[i]];
+    return out;
+  }
+
+  /**
+   * Python: build_white_spot_tint_with_mask
+   * (spot tint image, coverage mask) 를 만든다.
+   *  - invert=True: 색반전 → 어두운 원화일수록 흰 잉크↑
+   *  - coverage mask = 알파 실루엣을 build_white_mask(0.15mm 인셋) 로 축소
+   */
+  function build_white_spot_tint_with_mask(rgbaData, width, height, {
+    output_black = 0,
+    output_white = 170,
+    alpha_threshold = 1,
+    inset_coverage_mask = true,
+    invert = true,
+  } = {}) {
+    const n = width * height;
+
+    // 1. RGBA -> RGB -> L (PIL: rgb.convert("L") == ITU-R 601-2 luma)
+    const gray = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      const r = rgbaData[i * 4];
+      const g = rgbaData[i * 4 + 1];
+      const b = rgbaData[i * 4 + 2];
+      // Pillow Convert.c rgb2l: L24(in) >> 16, L24 = 19595*R + 38470*G + 7471*B + 0x8000
+      const lum = (r * 19595 + g * 38470 + b * 7471 + 0x8000) >> 16;
+      gray[i] = invert ? 255 - lum : lum;
+    }
+
+    // 2. Output levels
+    const leveled = apply_output_levels(gray, output_black, output_white);
+
+    // 3. Alpha silhouette threshold -> binary coverage
+    const threshold = Math.max(0, Math.min(255, Math.trunc(alpha_threshold)));
+    let coverage = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      coverage[i] = rgbaData[i * 4 + 3] >= threshold ? 255 : 0;
+    }
+
+    // 4. Inset coverage mask (Python: raster.masks.build_white_mask)
+    if (inset_coverage_mask) {
+      coverage = build_white_mask(coverage, width, height);
+    }
+
+    // 5. composite(leveled, black, coverage)
+    const composite = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      composite[i] = coverage[i] > 0 ? leveled[i] : 0;
+    }
+    return {
+      raster: { data: composite, width, height },
+      coverage: { data: coverage, width, height },
+    };
+  }
+
+  /** Python: build_white_spot_tint_image (returns tint only) */
+  function build_white_spot_tint_image(rgbaData, width, height, options = {}) {
+    return build_white_spot_tint_with_mask(rgbaData, width, height, options).raster;
+  }
+
+  /** Python: extract_white_grayscale (backward-compatible wrapper) */
+  function extract_white_grayscale(rgbaData, width, height, invert = true) {
+    return build_white_spot_tint_image(rgbaData, width, height, {
+      output_black: 0, output_white: 170, invert,
+    });
+  }
+
+  /** Python: build_spot1_flat_fill(mask, fill_ratio=0.25) */
+  function build_spot1_flat_fill(mask, fill_ratio = 0.25) {
+    const w = mask.width, h = mask.height;
+    const fill = Math.round(255.0 * fill_ratio);
+    const data = new Uint8Array(w * h);
+    for (let i = 0; i < data.length; i++) {
+      data[i] = mask.data[i] > 0 ? fill : 0;
+    }
+    return { width: w, height: h, data };
+  }
+
+  /** Python: resolve_white_spot */
+  function resolve_white_spot(name) {
+    const key = String(name).toLowerCase();
+    if (!WHITE_SPOT_NAMES[key]) {
+      throw new Error(`white spot must be one of: ${Object.keys(WHITE_SPOT_NAMES).sort().join(', ')}`);
+    }
+    return WHITE_SPOT_NAMES[key];
+  }
+
   // --- Browser Image Utilities ---
 
   /**
@@ -230,26 +340,218 @@
   }
 
   /**
-   * Resize RGBA image using nearest-neighbor (fast, good enough for mask generation)
+   * Pillow Image.Resampling.LANCZOS 의 비트 단위 동일 포팅 (8bpc, RGBA).
+   *
+   * Pillow 동작 (Image.py resize + Convert.c + Resample.c 13.0.0):
+   *   1. RGBA → RGBa  : MULDIV255(c, a) = SHIFTFORDIV255(c*a + 128),
+   *                     SHIFTFORDIV255(x) = ((x >> 8) + x) >> 8   (프리멀티플라이)
+   *   2. 수평/수직 리샘플: 가중치를 INT32 로 양자화
+   *        PRECISION_BITS = 32 - 8 - 2 = 22
+   *        kk = int( round-half-away-from-zero(prekk * (1 << 22)) )
+   *      각 픽셀: ss = (1 << 21) + Σ pixel*kk ; out = clip8_lookups[ss >> 22]
+   *      clip8_lookups 는 [-640 .. 639] 테이블 → 실질적으로 round + clamp(0,255)
+   *   3. RGBa → RGBA  : a==0 or a==255 → 원값, 그 외 CLIP8((255*c)/alpha)
+   *
+   * 픽셀 단위로 Python 결과와 완전히 일치한다.
+   */
+  const PRECISION_BITS = 22;
+  const PRECISION_SCALE = 1 << PRECISION_BITS;      // 4194304
+  const PRECISION_HALF = 1 << (PRECISION_BITS - 1); // 2097152
+
+  function lanczosFilter(x) {
+    // Pillow: if (-3.0 <= x && x < 3.0) return sinc(x) * sinc(x/3);
+    if (x >= -3.0 && x < 3.0) {
+      let s;
+      if (x === 0.0) s = 1.0;
+      else { const px = x * Math.PI; s = Math.sin(px) / px; }
+      const x3 = x / 3.0;
+      let s3;
+      if (x3 === 0.0) s3 = 1.0;
+      else { const px3 = x3 * Math.PI; s3 = Math.sin(px3) / px3; }
+      return s * s3;
+    }
+    return 0.0;
+  }
+
+  /** Pillow precompute_coeffs + normalize_coeffs_8bpc */
+  function buildPillowCoeffs(inSize, outSize) {
+    let scale = inSize / outSize;
+    let filterscale = scale < 1.0 ? 1.0 : scale;
+    const support = 3.0 * filterscale;
+    const ksize = Math.ceil(support) * 2 + 1;
+    const bounds = new Int32Array(outSize * 2);
+    const kk = new Int32Array(outSize * ksize);
+    const prekk = new Float64Array(outSize * ksize);
+    const invFilterscale = 1.0 / filterscale;
+
+    for (let xx = 0; xx < outSize; xx++) {
+      const center = (xx + 0.5) * scale;
+      let ww = 0.0;
+      let xmin = Math.trunc(center - support + 0.5);
+      if (xmin < 0) xmin = 0;
+      let xmax = Math.trunc(center + support + 0.5);
+      if (xmax > inSize) xmax = inSize;
+      const count = xmax - xmin;
+      const base = xx * ksize;
+      for (let x = 0; x < count; x++) {
+        const w = lanczosFilter((x + xmin - center + 0.5) * invFilterscale);
+        prekk[base + x] = w;
+        ww += w;
+      }
+      if (ww !== 0.0) {
+        for (let x = 0; x < count; x++) prekk[base + x] /= ww;
+      }
+      for (let x = count; x < ksize; x++) prekk[base + x] = 0;
+      bounds[xx * 2] = xmin;
+      bounds[xx * 2 + 1] = count;
+    }
+    // normalize_coeffs_8bpc: (int)(±0.5 + v * (1 << 22)) — C truncation toward zero
+    for (let i = 0; i < prekk.length; i++) {
+      const v = prekk[i];
+      kk[i] = v < 0 ? Math.trunc(-0.5 + v * PRECISION_SCALE) : Math.trunc(0.5 + v * PRECISION_SCALE);
+    }
+    return { bounds, kk, ksize };
+  }
+
+  /** Pillow _ImagingResampleHorizontal_8bpc (RGBA, 4 bands) */
+  function resampleHorizontalRGBA(src, srcW, srcH, dstW, coef) {
+    const out = new Uint8Array(dstW * srcH * 4);
+    const { bounds, kk, ksize } = coef;
+    for (let yy = 0; yy < srcH; yy++) {
+      const inOff = yy * srcW * 4;
+      const outOff = yy * dstW * 4;
+      for (let xx = 0; xx < dstW; xx++) {
+        const xmin = bounds[xx * 2];
+        const count = bounds[xx * 2 + 1];
+        const kBase = xx * ksize;
+        let ss0 = PRECISION_HALF, ss1 = PRECISION_HALF, ss2 = PRECISION_HALF, ss3 = PRECISION_HALF;
+        for (let x = 0; x < count; x++) {
+          const k = kk[kBase + x];
+          const si = inOff + (x + xmin) * 4;
+          ss0 += src[si] * k;
+          ss1 += src[si + 1] * k;
+          ss2 += src[si + 2] * k;
+          ss3 += src[si + 3] * k;
+        }
+        const di = outOff + xx * 4;
+        out[di] = clip8(ss0);
+        out[di + 1] = clip8(ss1);
+        out[di + 2] = clip8(ss2);
+        out[di + 3] = clip8(ss3);
+      }
+    }
+    return out;
+  }
+
+  /** Pillow _ImagingResampleVertical_8bpc (RGBA, 4 bands) */
+  function resampleVerticalRGBA(src, srcW, srcH, dstH, coef) {
+    const out = new Uint8Array(srcW * dstH * 4);
+    const { bounds, kk, ksize } = coef;
+    for (let yy = 0; yy < dstH; yy++) {
+      const ymin = bounds[yy * 2];
+      const count = bounds[yy * 2 + 1];
+      const kBase = yy * ksize;
+      const outOff = yy * srcW * 4;
+      for (let xx = 0; xx < srcW; xx++) {
+        let ss0 = PRECISION_HALF, ss1 = PRECISION_HALF, ss2 = PRECISION_HALF, ss3 = PRECISION_HALF;
+        for (let y = 0; y < count; y++) {
+          const k = kk[kBase + y];
+          const si = ((y + ymin) * srcW + xx) * 4;
+          ss0 += src[si] * k;
+          ss1 += src[si + 1] * k;
+          ss2 += src[si + 2] * k;
+          ss3 += src[si + 3] * k;
+        }
+        const di = outOff + xx * 4;
+        out[di] = clip8(ss0);
+        out[di + 1] = clip8(ss1);
+        out[di + 2] = clip8(ss2);
+        out[di + 3] = clip8(ss3);
+      }
+    }
+    return out;
+  }
+
+  /** Pillow clip8(): clip8_lookups[in >> PRECISION_BITS] (테이블과 동일한 결과) */
+  function clip8(inValue) {
+    const v = inValue >> PRECISION_BITS;
+    if (v <= 0) return 0;
+    if (v >= 255) return 255;
+    return v;
+  }
+
+  /** Pillow MULDIV255(a, b) = SHIFTFORDIV255(a*b + 128) */
+  function mulDiv255(a, b) {
+    const tmp = a * b + 128;
+    return ((tmp >> 8) + tmp) >> 8;
+  }
+
+  /** Pillow CLIP8 */
+  function clip8Simple(v) {
+    return v <= 0 ? 0 : (v < 256 ? v : 255);
+  }
+
+  /**
+   * Resize RGBA image (Pillow Image.Resampling.LANCZOS 와 픽셀 단위 동일)
    * Returns { data: Uint8Array, width, height }
    */
   function resizeRGBA(rgbaData, width, height, targetWidth, targetHeight) {
-    const resized = new Uint8Array(targetWidth * targetHeight * 4);
-    const xRatio = width / targetWidth;
-    const yRatio = height / targetHeight;
-    for (let ty = 0; ty < targetHeight; ty++) {
-      for (let tx = 0; tx < targetWidth; tx++) {
-        const sx = Math.min(Math.floor(tx * xRatio), width - 1);
-        const sy = Math.min(Math.floor(ty * yRatio), height - 1);
-        const srcIdx = (sy * width + sx) * 4;
-        const dstIdx = (ty * targetWidth + tx) * 4;
-        resized[dstIdx] = rgbaData[srcIdx];
-        resized[dstIdx + 1] = rgbaData[srcIdx + 1];
-        resized[dstIdx + 2] = rgbaData[srcIdx + 2];
-        resized[dstIdx + 3] = rgbaData[srcIdx + 3];
+    if (targetWidth === width && targetHeight === height) {
+      return { data: new Uint8Array(rgbaData), width, height };
+    }
+
+    // 1) RGBA → RGBa (premultiply, Pillow Convert.c rgbA2rgba)
+    const premul = new Uint8Array(width * height * 4);
+    for (let i = 0, n = width * height; i < n; i++) {
+      const a = rgbaData[i * 4 + 3];
+      premul[i * 4] = mulDiv255(rgbaData[i * 4], a);
+      premul[i * 4 + 1] = mulDiv255(rgbaData[i * 4 + 1], a);
+      premul[i * 4 + 2] = mulDiv255(rgbaData[i * 4 + 2], a);
+      premul[i * 4 + 3] = a;
+    }
+
+    // 2) Pillow ImagingResampleInner 의 패스 순서 결정
+    const needHorizontal = targetWidth !== width;
+    const needVertical = targetHeight !== height;
+    const horizontalFirst = !((height - targetHeight) > 0 && (height - targetHeight) > (width - targetWidth) * 2);
+
+    let cur = premul, curW = width, curH = height;
+    if (horizontalFirst) {
+      if (needHorizontal) {
+        cur = resampleHorizontalRGBA(cur, curW, curH, targetWidth, buildPillowCoeffs(width, targetWidth));
+        curW = targetWidth;
+      }
+      if (needVertical) {
+        cur = resampleVerticalRGBA(cur, curW, curH, targetHeight, buildPillowCoeffs(height, targetHeight));
+        curH = targetHeight;
+      }
+    } else {
+      if (needVertical) {
+        cur = resampleVerticalRGBA(cur, curW, curH, targetHeight, buildPillowCoeffs(height, targetHeight));
+        curH = targetHeight;
+      }
+      if (needHorizontal) {
+        cur = resampleHorizontalRGBA(cur, curW, curH, targetWidth, buildPillowCoeffs(width, targetWidth));
+        curW = targetWidth;
       }
     }
-    return { data: resized, width: targetWidth, height: targetHeight };
+
+    // 3) RGBa → RGBA (unpremultiply, Pillow Convert.c rgba2rgbA)
+    const out = new Uint8Array(targetWidth * targetHeight * 4);
+    for (let i = 0, n = targetWidth * targetHeight; i < n; i++) {
+      const alpha = cur[i * 4 + 3];
+      if (alpha === 255 || alpha === 0) {
+        out[i * 4] = cur[i * 4];
+        out[i * 4 + 1] = cur[i * 4 + 1];
+        out[i * 4 + 2] = cur[i * 4 + 2];
+      } else {
+        out[i * 4] = clip8Simple(Math.trunc((255 * cur[i * 4]) / alpha));
+        out[i * 4 + 1] = clip8Simple(Math.trunc((255 * cur[i * 4 + 1]) / alpha));
+        out[i * 4 + 2] = clip8Simple(Math.trunc((255 * cur[i * 4 + 2]) / alpha));
+      }
+      out[i * 4 + 3] = alpha;
+    }
+    return { data: out, width: targetWidth, height: targetHeight };
   }
 
   /**
@@ -351,10 +653,13 @@
   // --- Vector Layout ---
 
   function translate_to_page(base_paths_pt, outline_outer_paths_pt, outline_inner_paths_pt, white_source_paths_pt, white_paths_pt, raster_size_pt) {
-    const [min_x, min_y, max_x, max_y] = geometry_bounds({
-      raster_size_pt,
-      paths_groups: [base_paths_pt, outline_outer_paths_pt, outline_inner_paths_pt, white_source_paths_pt, white_paths_pt]
-    });
+    // Python(engine/vector/layout.py): combined_bounds 는 raster_size_pt 를 포함해
+    // min 을 0 으로, max 를 raster 크기로 초기화한다. 페이지가 래스터 영역을 항상 담도록.
+    const [min_x, min_y, max_x, max_y] = combined_bounds &&
+      combined_bounds(raster_size_pt, [base_paths_pt, outline_outer_paths_pt, outline_inner_paths_pt, white_source_paths_pt, white_paths_pt])
+      || geometry_bounds({
+        paths_groups: [base_paths_pt, outline_outer_paths_pt, outline_inner_paths_pt, white_source_paths_pt, white_paths_pt]
+      });
     const offset_x = -min_x;
     const offset_y = -min_y;
     const translated_base = base_paths_pt.map(p => translate_path(p, offset_x, offset_y));
@@ -562,7 +867,7 @@
       outer_paths_pt: expanded_outline_pt,
       bbox_pt: geometry_bounds({ paths_groups: [expanded_outline_pt] }),
     }));
-    const outline_outer_paths_pt = keep_largest_path_only(offset_paths(expanded_outline_pt, -mm_to_pt(OUTLINE_SHRINK_MM)));
+    let outline_outer_paths_pt = keep_largest_path_only(offset_paths(expanded_outline_pt, -mm_to_pt(OUTLINE_SHRINK_MM)));
     if (!outline_outer_paths_pt.length) throw new Error('outline layer generation produced an empty result');
     emit_trace(observer, new TraceFrame({
       stage: 'outline_shrink',
@@ -616,16 +921,27 @@
       }
     }
 
-    // 7. White Mask & Spot
+    // 7. White Mask & Spot (Python: pipeline.py / vector/white.py)
     let white_raster_img = null, white_coverage_mask = null, white_spot1_img = null;
     if (skip_white) {
-      white_raster_img = create_mock_image(resized.width, resized.height, 255);
-      white_coverage_mask = create_mock_image(resized.width, resized.height, 0);
+      white_raster_img = create_solid_image(resized.width, resized.height, 255);
+      white_coverage_mask = create_solid_image(resized.width, resized.height, 0);
     } else {
-      const white_mask = build_white_mask(mask, working_image.width, working_image.height);
-      white_raster_img = { data: white_mask, width: resized.width, height: resized.height };
-      white_coverage_mask = { data: white_mask, width: working_image.width, height: working_image.height };
-      white_spot1_img = create_spot1_from_mask(white_coverage_mask);
+      // invert=True(기본): 색반전 → 어두운 원화일수록 높은 값(흰 잉크↑) → Spot_0 분판
+      const white = build_white_spot_tint_with_mask(
+        resized.data, resized.width, resized.height,
+        { output_black: 0, output_white: 170, invert: true }
+      );
+      white_raster_img = white.raster;
+      white_coverage_mask = white.coverage;
+      emit_raster_trace(observer, 'white_mask',
+        'White layer: grayscale spot tint with 85/255 output levels and inset alpha coverage mask.',
+        white_raster_img, [0, 0, px_to_pt(white_raster_img.width), px_to_pt(white_raster_img.height)], preset_name);
+
+      // Spot_1 플레이트: 기본 화이트 스팟이 'spot_0'일 때만 생성
+      if (DEFAULT_WHITE_SPOT === 'spot_0') {
+        white_spot1_img = build_spot1_flat_fill(white_coverage_mask, 0.25);
+      }
     }
 
     // 8. Translate to Page
@@ -677,20 +993,10 @@
     }
   }
 
-  // --- Mock/Helper image creation (for white mask outputs) ---
+  // --- Helper: solid single-channel image (Python: Image.new("L", size, value)) ---
 
-  function create_mock_image(w, h, val) {
+  function create_solid_image(w, h, val) {
     const data = new Uint8Array(w * h).fill(val);
-    return { width: w, height: h, data };
-  }
-
-  function create_spot1_from_mask(mask) {
-    // Spot_1: flat 25% fill inside coverage mask
-    const w = mask.width, h = mask.height;
-    const data = new Uint8Array(w * h);
-    for (let i = 0; i < w * h; i++) {
-      data[i] = mask.data[i] > 0 ? Math.round(255 * 0.25) : 0;
-    }
     return { width: w, height: h, data };
   }
 
@@ -765,6 +1071,15 @@
     build_base_outline_path,
     build_reinforced_keyring_outer_path,
     build_keyring_balance,
+    // White spot (port of vector/white.py)
+    DEFAULT_WHITE_SPOT,
+    WHITE_SPOT_NAMES,
+    resolve_white_spot,
+    apply_output_levels,
+    build_white_spot_tint_with_mask,
+    build_white_spot_tint_image,
+    extract_white_grayscale,
+    build_spot1_flat_fill,
     // Browser utilities
     loadImageFromFile,
     imageToRGBA,

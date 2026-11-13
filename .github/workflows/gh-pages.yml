@@ -1,0 +1,46 @@
+name: GitHub Pages Deployment
+
+on:
+  push:
+    branches:
+      - arena/4ae49d96-illupdf
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify Geometry Tests
+        run: |
+          if [ -f tests/test_geometry.js ]; then
+            node tests/test_geometry.js
+          fi
+
+      - name: Upload artifact for deployment
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+          name: github-pages-artifact-${{ github.run_id }}
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-artifact-${{ github.run_id }}
