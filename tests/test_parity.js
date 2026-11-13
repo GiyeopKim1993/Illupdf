@@ -144,6 +144,50 @@ check('PDF document structure', () => {
   assert.ok(doc.page_content.includes('/ImWhiteSpot1 Do'));
 });
 
+// 9. cv2.approxPolyDP(closed=True) 규칙 일치 — cv2 5.0.0 실측 픽스처
+//    approxPolyDP_ 의 'init_iters=3 + 투영 거리 + clean-up 패스' 3가지를
+//    모두 재현해야 정점 순서까지 같아진다.
+check('approxPolyDPClosed == cv2 (정점 순서까지)', () => {
+  const input = [
+    [160, 100], [160, 103], [159, 106], [158, 109], [157, 112], [155, 115], [153, 118],
+    [151, 121], [149, 124], [146, 126], [142, 128], [139, 130], [135, 132], [131, 134],
+    [127, 136], [123, 137], [119, 138], [114, 139], [109, 140], [105, 140], [100, 140],
+    [95, 140], [91, 140], [86, 139], [81, 138], [77, 137], [73, 136], [69, 134], [65, 132],
+    [61, 130], [58, 128], [54, 126], [51, 124], [49, 121], [47, 118], [45, 115], [43, 112],
+    [42, 109], [41, 106], [40, 103], [40, 100], [40, 97], [41, 94], [42, 91], [43, 88],
+    [45, 85], [47, 82], [49, 79], [51, 76], [54, 74], [58, 72], [61, 70], [65, 68], [69, 66],
+    [73, 64], [77, 63], [81, 62], [86, 61], [91, 60], [95, 60], [100, 60], [105, 60],
+    [109, 60], [114, 61], [119, 62], [123, 63], [127, 64], [131, 66], [135, 68], [139, 70],
+    [142, 72], [146, 74], [149, 76], [151, 79], [153, 82], [155, 85], [157, 88], [158, 91],
+    [159, 94], [160, 97],
+  ];
+  const expected = [[160, 97], [149, 124], [109, 140], [61, 130], [40, 103], [51, 76], [91, 60], [139, 70]];
+  const got = IlluGeometry.approxPolyDPClosed(input, 9.0).map((p) => [Math.round(p[0]), Math.round(p[1])]);
+  assert.deepStrictEqual(got, expected);
+});
+
+// 10. findContours 정점 순서 == cv2 (최상단-최좌단 시작, 시계방향)
+check('contour 정점 순서 == cv2 findContours', () => {
+  const W = 16, H = 16;
+  const mask = new Uint8Array(W * H);
+  for (let y = 2; y < 14; y++) for (let x = 2; x < 14; x++) mask[y * W + x] = 1;
+  const loops = IlluGeometry.extract_significant_outer_contours(mask, W, H, 1440);
+  assert.strictEqual(loops.length, 1);
+  const pts = loops[0].points || loops[0];
+  // cv2: 12x12 블록 → 왼쪽 변을 위에서 아래로, 아래 변을 왼→오, ...
+  assert.deepStrictEqual(pts[0], [2, 2], '첫 점은 최상단-최좌단이어야 한다');
+  assert.deepStrictEqual(pts[1], [2, 3], '진행 방향은 시계방향(아래)이어야 한다');
+  assert.strictEqual(pts.length, 44, 'cv2 CHAIN_APPROX_NONE 과 동일한 44점이어야 한다');
+});
+
+// 11. 타깃 픽셀 크기 == Python compute_target_size_pixels (scale 방식)
+//     비율을 직접 나누면 반올림이 달라져 3288x6221 이 되어버린다.
+check('compute_target_size_pixels == Python (portrait)', () => {
+  const mm = 58.0, PPI = 1440;
+  const scale = ((mm / 25.4) * PPI) / Math.max(871, 1648);
+  assert.deepStrictEqual([Math.round(871 * scale), Math.round(1648 * scale)], [1738, 3288]);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 console.log(failed === 0 ? '=== ALL PARITY TESTS PASSED ===' : '=== PARITY TESTS FAILED ===');
 process.exit(failed === 0 ? 0 : 1);
