@@ -74,8 +74,53 @@ print(final_outline_long_side_mm(p))
 EOF
 ```
 
-## 미리보기
+## 결과물 받기
+
+### 키링 PDF 8개 (저장소에 포함)
+
+`pdf/keyring/` 폴더에서 바로 받을 수 있습니다 (3.8~5.3MB, 총 37MB).
+
+| 아티팩트 | 파일 | 크기 | 최종 크기 |
+|---|---|---:|---:|
+| art1 | [pdf_art1_keyring.pdf](pdf/keyring/pdf_art1_keyring.pdf) | 3.8MB | 65.846mm |
+| art2 | [pdf_art2_keyring.pdf](pdf/keyring/pdf_art2_keyring.pdf) | 5.3MB | 65.899mm |
+| art3 | [pdf_art3_keyring.pdf](pdf/keyring/pdf_art3_keyring.pdf) | 3.9MB | 65.166mm |
+| art4 | [pdf_art4_keyring.pdf](pdf/keyring/pdf_art4_keyring.pdf) | 5.1MB | 65.261mm |
+| art5 | [pdf_art5_keyring.pdf](pdf/keyring/pdf_art5_keyring.pdf) | 5.2MB | 65.305mm |
+| art6 | [pdf_art6_keyring.pdf](pdf/keyring/pdf_art6_keyring.pdf) | 4.2MB | 65.281mm |
+| art7 | [pdf_art7_keyring.pdf](pdf/keyring/pdf_art7_keyring.pdf) | 5.1MB | 65.779mm |
+| art8 | [pdf_art8_keyring.pdf](pdf/keyring/pdf_art8_keyring.pdf) | 4.4MB | 65.218mm |
+
+### 스탠드 PDF 8개
+
+스탠드 1개가 18~24MB(총 165MB)라 저장소에 넣지 않았습니다.
+`js/` 엔진으로 아래처럼 직접 생성할 수 있습니다:
+
+```bash
+node - <<'EOF'
+global.document = { createElement: () => ({ getContext: () => ({
+  createImageData:(w,h)=>({data:new Uint8ClampedArray(w*h*4)}),
+  putImageData(){}, drawImage(){},
+  getImageData:(x,y,w,h)=>({data:new Uint8ClampedArray(w*h*4)}) }) }) };
+const fs=require('fs');
+const C=require('./js/converting-engine.js');
+const P=require('./js/pdf-engine.js');
+const W=require('./js/pdf-writer.js');
+(async () => {
+  const meta=JSON.parse(fs.readFileSync('art1.json'));
+  const raw=new Uint8Array(fs.readFileSync('art1.raw'));
+  const p=C.prepare_artwork_from_rgba({rgbaData:raw,width:meta.width,height:meta.height,
+    preset_name:'stand',size_mm:null,observer:null,mask_alpha_threshold:8});
+  const bytes=await W.assemble_pdf_bytes(P.build_combined_pdf(p,{}));
+  fs.writeFileSync('art1_stand.pdf', Buffer.from(bytes));
+})();
+EOF
+```
+
+브라우저(https://giyeopkim1993.github.io/Illupdf/)에서는 같은 결과를
+파일 업로드만으로 받을 수 있습니다.
+
+### 미리보기
 
 `preview/` 폴더에 16개 PDF 를 120dpi 로 렌더한 PNG 가 있습니다
-(`art{1..8}_{keyring,stand}.png`). PDF 원본은 용량(스탠드 1개 18~24MB) 때문에
-저장소에 넣지 않았습니다.
+(`art{1..8}_{keyring,stand}.png`). PDF 를 열지 않고 결과를 눈으로 확인할 때 쓰세요.
