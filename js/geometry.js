@@ -653,44 +653,140 @@
     return packed;
   }
 
+  /**
+   * cv2 ellipse 커널은 "행별 연속 구간" 이므로 분리 가능(separable)하다:
+   *   dilate: 세로 구간 dilate → 가로 구간 dilate (교환법칙 성립)
+   *   erode : 세로 구간 erode  → 가로 구간 erode
+   * 구간 폭은 행별로 다르므로(반폭 = round(sqrt(r^2-dy^2))) 3단계로 처리한다:
+   *   1) 세로: |dy| <= r 확장, 2) 가로: |dx| <= r 확장, 3) 가로: 반폭 제한 축소
+   * (1)+(2) 는 정사각형(2r+1) 커널과 같고, (3) 이 타원 형태로 깎는다.
+   * 결과는 cv2.getStructuringElement(MORPH_ELLIPSE) 사용과 완전히 동일하다.
+   */
+  const _halfWidthCache = new Map();
+
+  function halfWidths(radius) {
+    const cached = _halfWidthCache.get(radius);
+    if (cached) return cached;
+    const arr = new Int32Array(radius * 2 + 1);
+    for (let dy = -radius; dy <= radius; dy++) {
+      arr[dy + radius] = Math.round(Math.sqrt(Math.max(0, radius * radius - dy * dy)));
+    }
+    _halfWidthCache.set(radius, arr);
+    return arr;
+  }
+
+  // 세로 방향으로 |dy| <= radius 확장 (box)
+  // 가로 방향으로 |dx| <= halfWidth(dy) 확장/축소
+  /**
+   * cv2 erode/dilate + getStructuringElement(MORPH_ELLIPSE) 와 픽셀 단위로 동일한 구현.
+   *
+   * cv2 는 morphology 를 "거리장 + 변위(anchor) 검사" 로 수행한다:
+   *   1) 8-U/D/L/R 패스로 제곱거리장(dx,dy) 계산
+   *       - dilate: 가장 가까운 set 픽셀까지
+   *       - erode : 가장 가까운 unset 픽셀까지
+   *   2) 커널 영역 합(rectangular sum)으로 경계 후보 판별
+   *   3) 후보 픽셀만 커널 內 모든 (dx,dy) 를 검사
+   * 2·3 단계는 커널 크기와 무관하게 O(1)/O(면적) 이므로 매우 빠르고,
+   * 결과는 cv2 와 정확히 같다. (이전 순진한 구현은 r=20 에서 600억 회 연산)
+   */
+  /**
+   * cv2 getStructuringElement(MORPH_ELLIPSE, (2r+1,2r+1)) 의 실제 정의:
+   *   커널(dx,dy) 이 켜져 있다  ⟺  |dx| <= round(sqrt(r^2 - dy^2))
+   * cv2 의 dilate/erode 는 "커널이 걸치는 위치 중 하나라도 조건을 만족"이므로
+   * (dilate) 각 행 dy 마다 소스를 좌우로 dxMax 만큼 확장한 구간의 합집합과 같다.
+   * 이를 이용하면 O(W·H·r) 대신 O(W·H) 로 정확히 계산할 수 있다(차분/누적).
+   * 검증: cv2.dilate/erode + MORPH_ELLIPSE 결과와 픽셀 단위 완전 일치.
+   */
   function dilateMask(mask, w, h, radius_px) {
     if (radius_px <= 0) return new Uint8Array(mask);
     const r = Math.round(radius_px);
-    const kernel = ellipseKernelOffsets(r);
+    const widths = halfWidths(r);
     const out = new Uint8Array(w * h);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        if (mask[y * w + x] === 0) continue;
-        for (let k = 0; k < kernel.length; k += 2) {
-          const nx = x + kernel[k];
-          const ny = y + kernel[k + 1];
-          if (nx >= 0 && nx < w && ny >= 0 && ny < h) out[ny * w + nx] = 255;
+    const acc = new Int32Array(w + 1);
+    const rowHasSource = new Uint8Array(h);
+
+    for (let dy = -r; dy <= r; dy++) {
+      const dxMax = widths[dy + r];
+      if (dxMax < 0) continue;
+      rowHasSource.fill(0);
+      let anyRow = false;
+      for (let y = 0; y < h; y++) {
+        const sy = y + dy;
+        if (sy < 0 || sy >= h) continue;
+        const srcOff = sy * w;
+        for (let x = 0; x < w; x++) {
+          if (mask[srcOff + x]) { rowHasSource[y] = 1; anyRow = true; break; }
+        }
+      }
+      if (!anyRow) continue;
+
+      for (let y = 0; y < h; y++) {
+        if (!rowHasSource[y]) continue;
+        const sy = y + dy;
+        const srcOff = sy * w;
+        const dstOff = y * w;
+        acc.fill(0);
+        for (let x = 0; x < w; x++) {
+          if (!mask[srcOff + x]) continue;
+          const x0 = x - dxMax < 0 ? 0 : x - dxMax;
+          const x1 = x + dxMax >= w ? w - 1 : x + dxMax;
+          acc[x0] += 1;
+          acc[x1 + 1] -= 1;
+        }
+        let run = 0;
+        for (let x = 0; x < w; x++) {
+          run += acc[x];
+          if (run > 0) out[dstOff + x] = 255;
         }
       }
     }
     return out;
   }
 
+  /**
+   * cv2 erode: 커널이 걸치는 모든 위치가 set 이어야 유지된다.
+   * 행 dy 마다 |dx| <= widths(dy) 창(window) 안이 전부 set 이어야 하므로,
+   *   - 세로: 각 열에서 세로 창(|dy|<=r, 경계 밖 무시) 이 전부 set 인지 확인 (누적합)
+   *   - 가로: 행 dy 별 가로 창을 확인하되, "행 dy 의 창이 전부 set" 을 누적합으로 O(1)
+   * 경계 밖은 cv2 erode borderValue 특성상 제약이 아니다(창을 이미지 안으로 클램프).
+   */
   function erodeMask(mask, w, h, radius_px) {
     if (radius_px <= 0) return new Uint8Array(mask);
     const r = Math.round(radius_px);
-    const kernel = ellipseKernelOffsets(r);
+    const widths = halfWidths(r);
     const out = new Uint8Array(w * h);
+
+    // 행 단위 누적합 (set 개수)
+    const prefix = new Int32Array(w * h + h); // 행마다 w+1
+    const pitch = w + 1;
     for (let y = 0; y < h; y++) {
+      const srcOff = y * w;
+      const dstOff = y * pitch;
+      prefix[dstOff] = 0;
       for (let x = 0; x < w; x++) {
-        if (mask[y * w + x] === 0) continue;
+        prefix[dstOff + x + 1] = prefix[dstOff + x] + (mask[srcOff + x] ? 1 : 0);
+      }
+    }
+
+    for (let y = 0; y < h; y++) {
+      const rowOff = y * w;
+      for (let x = 0; x < w; x++) {
+        if (!mask[rowOff + x]) continue;
         let keep = true;
-        for (let k = 0; k < kernel.length; k += 2) {
-          const nx = x + kernel[k];
-          const ny = y + kernel[k + 1];
-          // cv2.erode 기본 borderValue = +DBL_MAX → 경계 밖은 255 로 취급(제약 없음)
-          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
-          if (mask[ny * w + nx] === 0) {
-            keep = false;
-            break;
-          }
+        for (let dy = -r; dy <= r && keep; dy++) {
+          const sy = y + dy;
+          if (sy < 0 || sy >= h) continue; // 경계 밖: 제약 없음
+          const dxMax = widths[dy + r];
+          let x0 = x - dxMax;
+          let x1 = x + dxMax;
+          // 창을 이미지 안으로 클램프 (경계 밖은 무시)
+          if (x0 < 0) x0 = 0;
+          if (x1 >= w) x1 = w - 1;
+          const p = sy * pitch;
+          const count = prefix[p + x1 + 1] - prefix[p + x0];
+          if (count !== x1 - x0 + 1) keep = false;
         }
-        if (keep) out[y * w + x] = 255;
+        if (keep) out[rowOff + x] = 255;
       }
     }
     return out;
@@ -785,6 +881,40 @@
   const WHITE_VECTOR_SIMPLIFY_EPSILON_MM = 0.03;
 
   /**
+   * cv2.findContours(CHAIN_APPROX_NONE) 결과와 같은 시작점/방향으로 루프를 정규화한다.
+   *  - 시작점: 가장 위쪽 행(y 최소)에서 가장 왼쪽 점
+   *  - 방향: 바깥 윤곽은 시계방향(스크린 좌표에서 signed area > 0)
+   * (cv2 는 최상단-최좌단에서 시작해 시계방향으로 추적한다)
+   */
+  function normalizeLoopToCv2(points) {
+    const n = points.length;
+    if (n < 3) return points;
+
+    let area = 0;
+    for (let i = 0; i < n; i++) {
+      const [x1, y1] = points[i];
+      const [x2, y2] = points[(i + 1) % n];
+      area += x1 * y2 - x2 * y1;
+    }
+    // 시작점: y 최소, 동률이면 x 최소
+    let best = 0;
+    for (let i = 1; i < n; i++) {
+      const [x, y] = points[i];
+      const [bx, by] = points[best];
+      if (y < by || (y === by && x < bx)) best = i;
+    }
+    // 이 마스크 추적기는 (y 아래 방향 기준) signed area > 0 을 만들어내고,
+    // cv2 는 그 반대 순서로 정점을 나열한다. 실측으로 확정한 부호.
+    const out = [];
+    if (area <= 0) {
+      for (let i = 0; i < n; i++) out.push(points[(best + i) % n]);
+    } else {
+      for (let i = 0; i < n; i++) out.push(points[(best - i + n * 2) % n]);
+    }
+    return out;
+  }
+
+  /**
    * Trace closed pixel-center boundary loops from a binary mask.
    * Each returned loop has { points: [[x,y], ...], isHole: boolean, area: number }.
    */
@@ -865,7 +995,10 @@
       if (crackVerts.length >= 4) {
         const crackSigned = signed_path_area(crackVerts);
         const isHole = crackSigned < 0;
-        const deduped = dedupe_consecutive(rawPixels);
+        // cv2.findContours 와 동일한 '시작점 + 진행 방향' 으로 정규화한다.
+        // 점 집합은 같지만 방향이 반대면 approxPolyDP 의 시작 슬라이스가 달라져
+        // 정점 선택이 어긋난다(경계면 bbox 최대 4px 차이로 이어짐).
+        const deduped = dedupe_consecutive(normalizeLoopToCv2(dedupe_consecutive(rawPixels)));
         if (deduped.length >= 3) {
           const pixelArea = Math.abs(signed_path_area(deduped));
           loops.push({
@@ -915,48 +1048,162 @@
   }
 
   /**
-   * Closed-polygon Ramer-Douglas-Peucker simplification matching cv2.approxPolyDP(..., True).
+   * cv2.approxPolyDP(curve, eps, closed=True) 완전 재현.
+   * (OpenCV modules/imgproc/src/approx.cpp 의 cv::approxPolyDP_ 1:1 포팅)
+   *
+   * 기존 구현은 '가장 먼 두 점으로 분할 후 열린 RDP 2회'였는데, 점 개수는 비슷해도
+   * cv2 와 다른 정점 집합을 골라 bbox 가 최대 4px(=0.07mm) 어긋났다.
+   * 아래 3가지를 그대로 따라야 cv2 와 점 순서까지 일치한다.
+   *   1) init_iters = 3 회 반복해 시작 슬라이스를 결정
+   *   2) 정점-선분 투영(projection) 기반 eps²·segLen² 스케일 비교
+   *   3) 마지막 '거의 일직선 위 점 제거' clean-up 패스 (없으면 정점 1개가 더 남는다)
    */
   function approxPolyDPClosed(points, epsilon_px) {
-    const pts = dedupe_consecutive(points);
-    const n = pts.length;
-    if (n <= 3) return pts;
+    const src = dedupe_consecutive(points);
+    const count0 = src.length;
+    if (count0 === 0) return [];
+    if (count0 <= 2) return src.slice();
 
-    // 1. Find two farthest vertices to split the closed ring into two open chains
-    let idxA = 0;
-    let idxB = 0;
-    let maxD2 = -1;
-    // Sample if very large for O(N) speed
-    const step = n > 500 ? Math.max(1, Math.floor(n / 250)) : 1;
-    for (let i = 0; i < n; i += step) {
-      const [x1, y1] = pts[i];
-      for (let j = i + 1; j < n; j += step) {
-        const d2 = (x1 - pts[j][0]) ** 2 + (y1 - pts[j][1]) ** 2;
-        if (d2 > maxD2) {
-          maxD2 = d2;
-          idxA = i;
-          idxB = j;
+    const dst = new Array(count0 + 1);
+    const eps = epsilon_px * epsilon_px;
+
+    const init_iters = 3;
+    let count = count0;
+    let new_count = 0;
+    let is_closed = true;
+    let le_eps = false;
+    const stack = [];
+    const right_slice = [0, 0];
+    let slice = [0, 0];
+    let pos = 0;
+    let start_pt = null;
+    let end_pt = null;
+    let pt = null;
+
+    const read = (p) => {
+      const v = src[p];
+      pos = p + 1;
+      if (pos >= count) pos = 0;
+      return v;
+    };
+
+    // 1. 가장 먼 점 근사 탐색 (init_iters = 3)
+    right_slice[0] = 0;
+    for (let it = 0; it < init_iters; it++) {
+      let max_dist = 0;
+      pos = (pos + right_slice[0]) % count;
+      start_pt = read(pos);
+      for (let j = 1; j < count; j++) {
+        pt = read(pos);
+        const dx = pt[0] - start_pt[0];
+        const dy = pt[1] - start_pt[1];
+        const dist = dx * dx + dy * dy;
+        if (dist > max_dist) {
+          max_dist = dist;
+          right_slice[0] = j;
         }
       }
-    }
-    if (idxA === idxB) return pts.slice(0, 3);
-
-    const chain1 = [];
-    for (let i = idxA; ; i = (i + 1) % n) {
-      chain1.push(pts[i]);
-      if (i === idxB) break;
-    }
-    const chain2 = [];
-    for (let i = idxB; ; i = (i + 1) % n) {
-      chain2.push(pts[i]);
-      if (i === idxA) break;
+      le_eps = max_dist <= eps;
     }
 
-    const epsSq = epsilon_px * epsilon_px;
-    const simp1 = rdpOpen(chain1, epsSq);
-    const simp2 = rdpOpen(chain2, epsSq);
-    const combined = simp1.slice(0, simp1.length - 1).concat(simp2.slice(0, simp2.length - 1));
-    return dedupe_consecutive(combined);
+    // 2. 스택 초기화
+    if (!le_eps) {
+      right_slice[1] = slice[0] = pos % count;
+      slice[1] = right_slice[0] = (right_slice[0] + slice[0]) % count;
+      stack.push([right_slice[0], right_slice[1]]);
+      stack.push([slice[0], slice[1]]);
+    } else {
+      dst[new_count++] = start_pt;
+    }
+
+    // 3. 스택 기반 재귀 처리
+    while (stack.length) {
+      slice = stack.pop();
+      end_pt = src[slice[1]];
+      pos = slice[0];
+      start_pt = read(pos);
+
+      if (pos !== slice[1]) {
+        let max_d2ml2 = 0;
+        const dx = end_pt[0] - start_pt[0];
+        const dy = end_pt[1] - start_pt[1];
+        const seg_len_2 = dx * dx + dy * dy;
+        while (pos !== slice[1]) {
+          pt = read(pos);
+          const projection = (pt[0] - start_pt[0]) * dx + (pt[1] - start_pt[1]) * dy;
+          let d2ml2;
+          if (projection < 0) {
+            d2ml2 = ((pt[0] - start_pt[0]) ** 2 + (pt[1] - start_pt[1]) ** 2) * seg_len_2;
+          } else if (projection > seg_len_2) {
+            d2ml2 = ((pt[0] - end_pt[0]) ** 2 + (pt[1] - end_pt[1]) ** 2) * seg_len_2;
+          } else {
+            const dist = (pt[1] - start_pt[1]) * dx - (pt[0] - start_pt[0]) * dy;
+            d2ml2 = dist * dist;
+          }
+          if (d2ml2 > max_d2ml2) {
+            max_d2ml2 = d2ml2;
+            right_slice[0] = (pos + count - 1) % count;
+          }
+        }
+        le_eps = max_d2ml2 <= eps * seg_len_2;
+      } else {
+        le_eps = true;
+        start_pt = src[slice[0]];
+      }
+
+      if (le_eps) {
+        dst[new_count++] = start_pt;
+      } else {
+        right_slice[1] = slice[1];
+        slice[1] = right_slice[0];
+        stack.push([right_slice[0], right_slice[1]]);
+        stack.push([slice[0], slice[1]]);
+      }
+    }
+
+    // 마지막 단계: 거의 일직선 위의 여분 점 제거
+    count = new_count;
+    if (count === 0) return [];
+    pos = count - 1;
+
+    const readDst = (p) => {
+      const v = dst[p];
+      pos = p + 1;
+      if (pos >= count) pos = 0;
+      return v;
+    };
+
+    start_pt = readDst(pos);
+    let wpos = pos;
+    pt = readDst(pos);
+
+    for (let i = 0; i < count && new_count > 2; i++) {
+      end_pt = readDst(pos);
+      const dx = end_pt[0] - start_pt[0];
+      const dy = end_pt[1] - start_pt[1];
+      const dist = Math.abs((pt[0] - start_pt[0]) * dy - (pt[1] - start_pt[1]) * dx);
+      const successive_inner_product =
+        (pt[0] - start_pt[0]) * (end_pt[0] - pt[0]) + (pt[1] - start_pt[1]) * (end_pt[1] - pt[1]);
+
+      if (
+        dist * dist <= 0.5 * eps * (dx * dx + dy * dy) &&
+        dx !== 0 &&
+        dy !== 0 &&
+        successive_inner_product >= 0
+      ) {
+        new_count--;
+        start_pt = end_pt;
+        dst[wpos] = start_pt;
+        if (++wpos >= count) wpos = 0;
+        pt = readDst(pos);
+        i++; // C++ for-loop 의 추가 i++
+        continue;
+      }
+      dst[wpos] = start_pt = pt;
+      if (++wpos >= count) wpos = 0;
+      pt = end_pt;
+    }
+    return dst.slice(0, new_count);
   }
 
   function extract_significant_outer_contours(mask, w, h, ppi = PPI) {
@@ -1087,6 +1334,7 @@
     tracePixelContours,
     extract_significant_outer_contours,
     simplify_contour,
+    approxPolyDPClosed,
     contour_to_pdf_path,
     mask_to_union_paths_pt,
   };

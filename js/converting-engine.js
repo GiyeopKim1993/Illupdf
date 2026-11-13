@@ -630,7 +630,7 @@
       message,
       preset_name,
       raster_b64,
-      raster_rect_pt,
+      raster_rect_pt: rect_pt,
       bbox_pt: [rect_pt[0], rect_pt[1], rect_pt[0] + rect_pt[2], rect_pt[1] + rect_pt[3]],
     });
     emit_trace(observer, frame);
@@ -751,6 +751,16 @@
         preset_name,
         status: 'done',
       }));
+      // Python: if observer is None: return initial_prepared
+      if (observer === null || observer === undefined) {
+        return prepare_artwork_for_raster_target({
+          cropped,
+          preset_name,
+          target_raster_long_side_mm: initial_raster_long_side_mm,
+          observer: null,
+          mask_alpha_threshold,
+        });
+      }
       return prepare_artwork_for_raster_target({
         cropped,
         preset_name,
@@ -983,14 +993,19 @@
 
   // --- Helper: compute target size in pixels ---
 
+  /**
+   * Python: raster/normalize.py compute_target_size_pixels
+   *   target_long_side_px = (mm / 25.4) * PPI
+   *   current_long_side_px = max(width, height)
+   *   scale = target_long_side_px / current_long_side_px
+   *   return round(width*scale), round(height*scale)
+   * (비율을 직접 나누는 방식은 반올림이 달라져 Python 과 픽셀 크기가 어긋난다)
+   */
   function compute_target_size_pixels(cropped, target_mm) {
-    const ratio = cropped.width / cropped.height;
-    const ppi = PPI;
-    if (cropped.width >= cropped.height) {
-      return [Math.round((target_mm / MM_PER_INCH) * ppi), Math.round((target_mm / MM_PER_INCH) * ppi / ratio)];
-    } else {
-      return [Math.round((target_mm / MM_PER_INCH) * ppi * ratio), Math.round((target_mm / MM_PER_INCH) * ppi)];
-    }
+    const targetLongSidePx = (target_mm / MM_PER_INCH) * PPI;
+    const currentLongSidePx = Math.max(cropped.width, cropped.height);
+    const scale = targetLongSidePx / currentLongSidePx;
+    return [Math.round(cropped.width * scale), Math.round(cropped.height * scale)];
   }
 
   // --- Helper: solid single-channel image (Python: Image.new("L", size, value)) ---
@@ -1004,11 +1019,13 @@
 
   function calibrate_raster_long_side_mm({ cropped, preset_name, target_final_size_mm, initial_raster_long_side_mm, mask_alpha_threshold = 8, tolerance_mm = CALIBRATION_TOLERANCE_MM, max_iterations = CALIBRATION_MAX_ITERATIONS }) {
     const measure = (raster_mm) => {
+      // Python: prepare_artwork_for_raster_target(..., skip_white=True)
+      // calibration 단계에서는 white/Spot_1 생성이 불필요하며, 크기 측정에도 영향이 없다.
       const prepared = prepare_artwork_for_raster_target({
         cropped, preset_name, target_raster_long_side_mm: Math.max(1.0, raster_mm), mask_alpha_threshold,
+        skip_white: true,
       });
-      const actual = final_outline_long_side_mm(prepared);
-      return actual;
+      return final_outline_long_side_mm(prepared);
     };
 
     let best_raster = Math.max(1.0, initial_raster_long_side_mm);
