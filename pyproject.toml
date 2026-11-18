@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "illupdf"
+version = "0.2.1"
+description = "Convert transparent artwork into Python-generated Illustrator-compatible layered PDFs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2,<3",
+  "opencv-python-headless>=4.13,<5",
+  "Pillow>=10,<13",
+  "pikepdf>=10,<11",
+  "pyclipper>=1.3,<2",
+  "PyMuPDF>=1.23,<2",
+  "shapely>=2,<3",
+]
+
+[project.scripts]
+illupdf = "illupdf.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
