@@ -667,16 +667,134 @@ def build_best_row(
     return min(beam, key=lambda row: (-len(row.placed), row.width_mm, row.height_mm))
 
 
-def _center_rows_and_group(rows: list[RowLayout], usable_width: float, usable_height: float, margin: float) -> list[PlacedItem]:
-    """Stand preset: centered vertically and horizontally."""
-    y = total_h = 0.0
-    raw: list[PlacedItem] = []
-    for row in rows:
-        raw.extend(PlacedItem(p.item, p.x_mm, y + p.y_mm) for p in row.placed)
-        y += row.height_mm + ROW_GAP_MM
-        total_h = y - ROW_GAP_MM
-    group_dy = margin + (usable_height - total_h) / 2.0
-    return [PlacedItem(p.item, p.x_mm + PAGE_MARGIN_X_MM, p.y_mm + group_dy) for p in raw]
+def _solve_row_order(
+    row: RowLayout,
+    options_by_instance: dict[str, list[OrientedItem]],
+    usable_width: float,
+    cache: PairOffsetCache,
+    options: PackingOptions,
+    beam_width: int = 192,
+) -> RowLayout:
+    """Re-solve the ordering of an already chosen item set for minimum width.
+
+    ``build_best_row`` picks its item set with a narrow beam (default 4-8) so
+    it can afford to consider every candidate. That narrow beam also freezes
+    the left-to-right order, which is what decides the final row width: the
+    pair offsets are directional, so packing the same items in a different
+    order can be several tens of mm narrower.
+
+    Here the item set is already fixed, so the search is cheap and can use a
+    much wider beam. The width-minimising order (and, per item, the
+    width-minimising rotation among its allowed options) is returned.
+    """
+    ids = [p.item.instance_id for p in row.placed]
+    if len(ids) < 2:
+        return row
+
+    beam = [RowLayout()]
+    for _ in range(len(ids)):
+        expanded: list[RowLayout] = []
+        for state in beam:
+            used = {p.item.instance_id for p in state.placed}
+            for iid in ids:
+                if iid in used:
+                    continue
+                placed = choose_orientation(options_by_instance[iid], state, usable_width, cache, options)
+                if placed is None:
+                    continue
+                expanded.append(RowLayout(
+                    state.placed + [placed],
+                    max(state.width_mm, placed.x_mm + placed.item.width_mm),
+                    max(state.height_mm, placed.item.height_mm),
+                ))
+        if not expanded:
+            break
+        # Width first: the whole point of this pass is a shorter row.
+        expanded.sort(key=lambda r: (r.width_mm, -len(r.placed), r.height_mm))
+        beam = expanded[: max(2, beam_width)]
+
+    best = min(beam, key=lambda r: (-len(r.placed), r.width_mm, r.height_mm))
+    if len(best.placed) < len(row.placed):
+        return row
+    return best if best.width_mm < row.width_mm else row
+
+
+def _refine_row_by_swaps(row: RowLayout, usable_width: float, cache: PairOffsetCache,
+                         options: PackingOptions, passes: int = 6) -> RowLayout:
+    """Cheap local search: adjacent/arbitrary swaps and reversal on a solved row.
+
+    The wide-beam solver can still miss an improvement, so the final layout is
+    polished by trying reorderings that re-place every item from scratch. Only
+    strictly narrower rows are accepted.
+    """
+    if len(row.placed) < 2:
+        return row
+
+    def rebuild(order: list[PlacedItem]) -> RowLayout | None:
+        state = RowLayout()
+        for p in order:
+            placed = place_candidate_by_pair_offsets(p.item, state, usable_width, cache, options)
+            if placed is None:
+                return None
+            state = RowLayout(
+                state.placed + [placed],
+                max(state.width_mm, placed.x_mm + placed.item.width_mm),
+                max(state.height_mm, placed.item.height_mm),
+            )
+        return state
+
+    best = row
+    for _ in range(passes):
+        improved = False
+        n = len(best.placed)
+        candidates: list[list[PlacedItem]] = [list(reversed(best.placed))]
+        for i in range(n):
+            for j in range(i + 1, n):
+                order = list(best.placed)
+                order[i], order[j] = order[j], order[i]
+                candidates.append(order)
+        for order in candidates:
+            trial = rebuild(order)
+            if trial is not None and len(trial.placed) == n and trial.width_mm < best.width_mm - 1e-6:
+                best = trial
+                improved = True
+        if not improved:
+            break
+    return best
+
+
+def _place_stand_rows(rows: list[RowLayout], usable_width: float, usable_height: float, margin: float) -> list[PlacedItem]:
+    """Stand preset: full artboard height, rows pinned to opposite corners.
+
+    Vertical: the first row sits at the bottom margin and the last row is
+    pushed up to the top margin, so the free space is central and can be
+    filled with pedestal bases. Horizontal offsets are already applied by the
+    alignment combo chosen in ``build_sheets`` (row 0 bottom-right, other rows
+    top-right by default) and are preserved here.
+    """
+    if not rows:
+        return []
+    heights = [row.height_mm for row in rows]
+    total_h = sum(heights) + ROW_GAP_MM * (len(rows) - 1)
+    slack = max(0.0, usable_height - total_h)
+
+    placed: list[PlacedItem] = []
+    for idx, row in enumerate(rows):
+        # First row bottom-aligned, last row top-aligned; anything between is
+        # spread evenly across the remaining slack.
+        if len(rows) == 1:
+            row_dy = margin
+        elif idx == 0:
+            row_dy = margin
+        elif idx == len(rows) - 1:
+            row_dy = margin + slack + sum(heights[:-1]) + ROW_GAP_MM * (len(rows) - 2)
+        else:
+            step = slack / max(1, len(rows) - 1)
+            row_dy = margin + step * idx + sum(heights[:idx]) + ROW_GAP_MM * idx
+        placed.extend(
+            PlacedItem(p.item, p.x_mm + PAGE_MARGIN_X_MM, p.y_mm + row_dy) for p in row.placed
+        )
+    return placed
 
 
 def _place_rows_keyring_fixed(rows: list[RowLayout], usable_width: float, margin: float) -> list[PlacedItem]:
@@ -709,7 +827,10 @@ def _place_rows_by_preset(
     preset = (preset or DEFAULT_PRESET).lower()
     if preset == "keyring":
         return _place_rows_keyring_fixed(rows, usable_width, margin)
-    # Default: stand (centered)
+    if preset == "stand":
+        # Keep the horizontal alignment already applied per row; only the
+        # vertical distribution is decided here.
+        return _place_stand_rows(rows, usable_width, usable_height, margin)
     return _center_rows_and_group(rows, usable_width, usable_height, margin)
 
 
@@ -822,7 +943,7 @@ def get_base_oriented_items() -> tuple[SourcePdf, dict[int, OrientedItem]]:
     return _base_cache[key]
 
 
-def fill_row_with_bases_shapely(row, usable_width, base_items, row_idx=0, estimated_y_base=0.0, sheet_h=300.0, clearance_mm=0.25, step_mm=5.0):
+def fill_row_with_bases_shapely(row, usable_width, base_items, row_idx=0, estimated_y_base=0.0, sheet_h=300.0, clearance_mm=0.25, step_mm=STEP_MM):
     from shapely.geometry import Polygon, LineString
     from shapely.ops import unary_union
     from shapely.affinity import translate
@@ -945,7 +1066,7 @@ def fill_row_with_bases_shapely(row, usable_width, base_items, row_idx=0, estima
     return bases
 
 
-def fill_sheet_with_bases_shapely(sheet, usable_width, usable_height, base_items, clearance_mm=0.25, step_mm=5.0):
+def fill_sheet_with_bases_shapely(sheet, usable_width, usable_height, base_items, clearance_mm=0.25, step_mm=STEP_MM):
     from shapely.geometry import Polygon, LineString, box
     from shapely.ops import unary_union
     from shapely.affinity import translate
@@ -1127,6 +1248,13 @@ def build_sheets(
             row = build_best_row(options_by_instance, candidates, usable_width, cache=cache, options=options)
             if not row.placed:
                 break
+            # Restore the old "try every order / flip and keep the shortest row"
+            # optimisation: the narrow-beam row above only fixes WHICH items go
+            # in the band, its left-to-right order is re-solved here so the band
+            # actually packs as many items as 400mm allows.
+            if preset in ("stand", "mixed") and len(row.placed) > 1:
+                row = _solve_row_order(row, options_by_instance, usable_width, cache, options)
+                row = _refine_row_by_swaps(row, usable_width, cache, options)
 
             # Requirement 5: In mixed preset, align KEYRING items vertically within row:
             # Row 0 (Bottom row on page): align towards BOTTOM relative to stand height (y = 0.0)
@@ -1179,7 +1307,14 @@ def build_sheets(
         # Evaluate alignment combinations (left, center, right per row: 3^N)
         # and select the layout that places the MAXIMUM number of pedestal bases.
         if preset in ["stand", "mixed"]:
-            align_choices = ["left", "center", "right"]
+            # Fixed alignment, NOT optimised: the bottom row must sit on the
+            # bottom-right corner and the top row on the top-right corner
+            # (Korean layout "상단열은 상단 우측 / 하단열은 하단 우측").
+            # Previously this loop searched left/center/right and picked the
+            # variant that fitted the most pedestal bases, which silently
+            # dragged both rows back to the centre. Bases now only fill
+            # whatever space is left over after the fixed alignment.
+            align_choices = ["right"]
             if len(raw_rows) == 1:
                 combos = [(c,) for c in align_choices]
             else:
