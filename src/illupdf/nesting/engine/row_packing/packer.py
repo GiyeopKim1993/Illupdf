@@ -20,7 +20,12 @@ ROW_GAP_MM = 0.25
 # Minimum required gap between adjacent items' safety outlines.
 # Safety outlines already include a +0.125mm offset, so requiring a 0.25mm
 # safety gap guarantees the rendered artwork outlines are also >= 0.25mm apart.
-MIN_SAFETY_GAP_MM = 0.25
+#
+# Raised to 0.5mm for cut artwork: the blade needs real clearance, and a
+# 0.31mm cutline-to-cutline gap measured in practice was too tight to plot
+# reliably. With the safety outline contributing +0.125mm on each side this
+# holds the rendered cutlines at least 0.5mm apart.
+MIN_SAFETY_GAP_MM = 0.5
 STEP_MM = 0.5
 
 DEFAULT_BEAM_WIDTH = 4
@@ -1165,7 +1170,10 @@ def build_sheets(
             raw_rows = [RowLayout([PlacedItem(opt, 0.0, 0.0)], opt.width_mm, opt.height_mm)]
             used_in_sheet.add(iid)
 
-        sheet_height = ARTBOARD_HEIGHT_MM / 2.0 if len(raw_rows) == 1 else ARTBOARD_HEIGHT_MM
+        # Always emit the full artboard. A single-row sheet used to collapse to
+        # half height (400x150), which silently changes the output page size
+        # between runs and breaks print setups that expect a fixed 400x300.
+        sheet_height = ARTBOARD_HEIGHT_MM
         usable_sheet_height = sheet_height - PAGE_MARGIN_Y_MM * 2
 
         # Evaluate alignment combinations (left, center, right per row: 3^N)
