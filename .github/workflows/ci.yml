@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - arena/4ae49d96-illupdf
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Geometry unit tests
+        run: node tests/test_geometry.js
+
+      - name: JS ↔ Python parity tests
+        run: node tests/test_parity.js
+
+      - name: Verify static site entry point
+        run: |
+          test -f index.html
+          test -f js/app.js
+          test -f js/converting-engine.js
+          test -f js/pdf-engine.js
+          test -f js/pdf-writer.js
+          test -f js/keyring-engine.js
+          echo "static site files present"
